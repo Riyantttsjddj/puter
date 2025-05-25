@@ -1,345 +1,230 @@
 #!/bin/bash
 set -e
 
-APP_DIR=/opt/chatgpt-clone
-SERVICE_NAME=chatgpt-clone
-FRONTEND_DIR=/var/www/chatgpt-frontend
-PORT=8080
+APP_DIR=/opt/chat-backend
+SERVICE_NAME=chat-backend
+USER=$(whoami)
 
-echo "Update sistem..."
-apt update && apt upgrade -y
+echo "Update dan install curl, git, build-essential..."
+sudo apt update
+sudo apt install -y curl git build-essential
 
-echo "Install dependencies dasar..."
-apt install -y curl git build-essential nginx
+echo "Install Node.js 18.x dari NodeSource..."
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+sudo apt install -y nodejs
 
-echo "Setup MongoDB repo untuk Ubuntu jammy"
-curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg
-echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
+echo "Buat direktori aplikasi di $APP_DIR"
+sudo mkdir -p $APP_DIR
+sudo chown $USER:$USER $APP_DIR
 
-echo "Update dan install mongodb-org..."
-apt update
-apt install -y mongodb-org
-
-echo "Enable dan start mongodb..."
-systemctl enable mongod
-systemctl start mongod
-
-# Install Node.js jika belum ada
-if ! command -v node >/dev/null 2>&1; then
-  echo "Install Node.js LTS..."
-  curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-  apt install -y nodejs
-fi
-
-echo "Buat folder aplikasi backend di $APP_DIR"
-mkdir -p $APP_DIR
+echo "Pindah ke direktori aplikasi..."
 cd $APP_DIR
 
-echo "Buat package.json"
-cat > package.json << EOF
-{
-  "name": "chatgpt-clone",
-  "version": "1.0.0",
-  "main": "server.js",
-  "license": "MIT",
-  "dependencies": {
-    "bcrypt": "^5.1.0",
-    "body-parser": "^1.20.2",
-    "cors": "^2.8.5",
-    "express": "^4.18.2",
-    "jsonwebtoken": "^9.0.0",
-    "mongoose": "^7.2.2"
-  }
-}
-EOF
+echo "Inisialisasi project npm dan install dependencies..."
+if [ ! -f package.json ]; then
+  npm init -y
+fi
+npm install express cors bcrypt jsonwebtoken body-parser dotenv
 
-echo "Buat server.js dengan port $PORT"
-cat > server.js << EOF
+echo "Buat file index.js backend..."
+cat > index.js <<'EOF'
+require('dotenv').config();
 const express = require('express');
-const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const bodyParser = require('body-parser');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
-const PORT = $PORT;
-const JWT_SECRET = 'ini_rahasia_123'; // ganti dengan secret key yang aman
+const PORT = process.env.PORT || 8080;
+const JWT_SECRET = process.env.JWT_SECRET || 'rahasia123';
+const JWT_EXPIRES_IN = '2h';
+
+const CHAT_DIR = path.join(__dirname, 'chats');
+if (!fs.existsSync(CHAT_DIR)) fs.mkdirSync(CHAT_DIR);
+
+const USERS_FILE = path.join(__dirname, 'users.json');
+
+let users = {};
+try {
+  if (fs.existsSync(USERS_FILE)) {
+    users = JSON.parse(fs.readFileSync(USERS_FILE));
+  }
+} catch (err) {
+  console.error('Gagal membaca users.json:', err);
+  users = {};
+}
+
+function saveUsers() {
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  } catch (err) {
+    console.error('Gagal menyimpan users.json:', err);
+  }
+}
 
 app.use(cors());
 app.use(bodyParser.json());
 
-mongoose.connect('mongodb://127.0.0.1:27017/chatgpt_clone', {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-});
+function formatResponse(text) {
+  if (!text || typeof text !== 'string') return '';
 
-const userSchema = new mongoose.Schema({
-    username: { type: String, unique: true },
-    password: String,
-});
+  if (text.startsWith('```') && text.endsWith('```')) return text;
 
-const chatSchema = new mongoose.Schema({
-    userId: mongoose.Schema.Types.ObjectId,
-    message: String,
-    response: String,
-    createdAt: { type: Date, default: Date.now },
-});
+  if (/function|const|let|var|=>|class|import|export|console\.log/.test(text)) {
+    return `\`\`\`js\n${text}\n\`\`\``;
+  }
 
-const User = mongoose.model('User', userSchema);
-const Chat = mongoose.model('Chat', chatSchema);
+  return text;
+}
+
+function saveChat(username, message, response) {
+  const file = path.join(CHAT_DIR, `${username}.json`);
+  let data = [];
+  try {
+    if (fs.existsSync(file)) {
+      data = JSON.parse(fs.readFileSync(file));
+    }
+  } catch (err) {
+    console.error('Gagal baca chat file:', err);
+  }
+  data.push({
+    message,
+    response,
+    time: new Date()
+  });
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error('Gagal simpan chat file:', err);
+  }
+}
+
+function getChat(username) {
+  const file = path.join(CHAT_DIR, `${username}.json`);
+  try {
+    if (fs.existsSync(file)) {
+      return JSON.parse(fs.readFileSync(file));
+    }
+  } catch (err) {
+    console.error('Gagal baca chat file:', err);
+  }
+  return [];
+}
+
+function clearChat(username) {
+  const file = path.join(CHAT_DIR, `${username}.json`);
+  try {
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+  } catch (err) {
+    console.error('Gagal hapus chat file:', err);
+  }
+}
 
 app.post('/register', async (req, res) => {
-    const { username, password } = req.body;
-    const hashed = await bcrypt.hash(password, 10);
-    try {
-        const user = new User({ username, password: hashed });
-        await user.save();
-        res.json({ success: true });
-    } catch (err) {
-        res.json({ success: false, message: 'Username sudah dipakai' });
-    }
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ success: false, message: 'Username dan password wajib diisi' });
+  if (users[username]) return res.status(409).json({ success: false, message: 'Username sudah terdaftar' });
+
+  try {
+    users[username] = await bcrypt.hash(password, 10);
+    saveUsers();
+    res.json({ success: true, message: 'Registrasi berhasil' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'Server error saat registrasi' });
+  }
 });
 
 app.post('/login', async (req, res) => {
-    const { username, password } = req.body;
-    const user = await User.findOne({ username });
-    if (!user) return res.json({ success: false, message: 'User tidak ditemukan' });
+  const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ success: false, message: 'Username dan password wajib diisi' });
 
-    const valid = await bcrypt.compare(password, user.password);
-    if (!valid) return res.json({ success: false, message: 'Password salah' });
+  const userPass = users[username];
+  if (!userPass) return res.status(401).json({ success: false, message: 'Username tidak ditemukan' });
 
-    const token = jwt.sign({ id: user._id, username: user.username }, JWT_SECRET);
-    res.json({ success: true, token, username: user.username });
+  try {
+    const isValid = await bcrypt.compare(password, userPass);
+    if (!isValid) return res.status(401).json({ success: false, message: 'Password salah' });
+
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: JWT_EXPIRES_IN });
+    res.json({ success: true, token, username, message: 'Login berhasil' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, message: 'Server error saat login' });
+  }
 });
 
 function auth(req, res, next) {
-    const token = req.headers['authorization'];
-    if (!token) return res.status(401).json({ message: 'Unauthorized' });
-    try {
-        const decoded = jwt.verify(token.split(' ')[1], JWT_SECRET);
-        req.user = decoded;
-        next();
-    } catch {
-        res.status(401).json({ message: 'Token tidak valid' });
-    }
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return res.status(401).json({ success: false, message: 'Unauthorized, token tidak ditemukan' });
+
+  const token = authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ success: false, message: 'Unauthorized, token kosong' });
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch {
+    res.status(401).json({ success: false, message: 'Invalid token' });
+  }
 }
 
-app.get('/chat', auth, async (req, res) => {
-    const chats = await Chat.find({ userId: req.user.id }).sort({ createdAt: 1 });
-    res.json(chats);
+app.get('/chat', auth, (req, res) => {
+  const chatData = getChat(req.user.username);
+  res.json({ success: true, chat: chatData });
 });
 
-app.post('/chat', auth, async (req, res) => {
-    const { message, response } = req.body;
-    const chat = new Chat({
-        userId: req.user.id,
-        message,
-        response,
-    });
-    await chat.save();
-    res.json({ success: true });
+app.post('/chat', auth, (req, res) => {
+  const { message } = req.body;
+  let { response } = req.body;
+
+  response = formatResponse(response);
+
+  saveChat(req.user.username, message, response);
+  res.json({ success: true, message: 'Chat tersimpan' });
 });
 
-app.listen(PORT, () => console.log(\`Server jalan di http://localhost:\${PORT}\`));
+app.post('/clear-chat', auth, (req, res) => {
+  clearChat(req.user.username);
+  res.json({ success: true, message: 'Chat berhasil dihapus' });
+});
+
+app.listen(PORT, () => console.log(`Backend jalan di http://localhost:${PORT}`));
 EOF
 
-echo "Install dependencies backend..."
-npm install
+echo "Buat file .env untuk konfigurasi PORT & JWT_SECRET"
+cat > .env <<EOF
+PORT=8080
+JWT_SECRET=rahasia123
+EOF
 
-echo "Setup systemd service $SERVICE_NAME"
-cat > /etc/systemd/system/$SERVICE_NAME.service << EOF
+echo "Buat service systemd untuk menjalankan backend"
+sudo tee /etc/systemd/system/$SERVICE_NAME.service > /dev/null <<EOF
 [Unit]
-Description=ChatGPT Clone Node.js Server
-After=network.target mongod.service
+Description=Chat Backend Service
+After=network.target
 
 [Service]
 Type=simple
-User=root
+User=$USER
 WorkingDirectory=$APP_DIR
-ExecStart=/usr/bin/node $APP_DIR/server.js
+ExecStart=$(which node) $APP_DIR/index.js
 Restart=on-failure
 RestartSec=5s
+Environment=NODE_ENV=production
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable $SERVICE_NAME
-systemctl start $SERVICE_NAME
+echo "Reload systemd daemon dan enable service..."
+sudo systemctl daemon-reload
+sudo systemctl enable $SERVICE_NAME
+sudo systemctl start $SERVICE_NAME
 
-echo "Setup frontend di $FRONTEND_DIR"
-mkdir -p $FRONTEND_DIR
-
-cat > $FRONTEND_DIR/index.html << 'EOF'
-<!DOCTYPE html>
-<html>
-<head>
-    <title>ChatGPT Clone</title>
-    <style>
-        #chat-box {
-            border: 1px solid #ccc; padding: 10px; height: 300px; overflow-y: auto; white-space: pre-wrap;
-        }
-    </style>
-</head>
-<body>
-    <div id="auth">
-        <h3>Login / Register</h3>
-        <input id="username" placeholder="Username"><br/>
-        <input id="password" type="password" placeholder="Password"><br/>
-        <button onclick="login()">Login</button>
-        <button onclick="register()">Register</button>
-        <p id="msg" style="color:red"></p>
-    </div>
-
-    <div id="chat" style="display:none;">
-        <h3>Chat dengan GPT</h3>
-        <div id="chat-box"></div><br/>
-        <textarea id="input" rows="3" cols="50" placeholder="Tulis pesan..."></textarea><br/>
-        <button onclick="sendChat()">Kirim</button>
-        <button onclick="logout()">Logout</button>
-    </div>
-
-    <script src="https://js.puter.com/v2/"></script>
-    <script>
-        let token = '';
-        let username = '';
-
-        function showMessage(msg, isError = false) {
-            const p = document.getElementById('msg');
-            p.style.color = isError ? 'red' : 'green';
-            p.textContent = msg;
-        }
-
-        function register() {
-            const user = document.getElementById('username').value.trim();
-            const pass = document.getElementById('password').value.trim();
-            if (!user || !pass) return showMessage('Username dan password harus diisi', true);
-
-            fetch('/register', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username: user, password: pass})
-            }).then(res => res.json())
-            .then(data => {
-                if(data.success){
-                    showMessage('Registrasi berhasil, silakan login');
-                } else {
-                    showMessage(data.message || 'Registrasi gagal', true);
-                }
-            });
-        }
-
-        function login() {
-            const user = document.getElementById('username').value.trim();
-            const pass = document.getElementById('password').value.trim();
-            if (!user || !pass) return showMessage('Username dan password harus diisi', true);
-
-            fetch('/login', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({username: user, password: pass})
-            }).then(res => res.json())
-            .then(data => {
-                if (data.success) {
-                    token = data.token;
-                    username = data.username;
-                    showMessage('');
-                    document.getElementById('auth').style.display = 'none';
-                    document.getElementById('chat').style.display = 'block';
-                    loadChat();
-                } else {
-                    showMessage(data.message || 'Login gagal', true);
-                }
-            });
-        }
-
-        function logout() {
-            token = '';
-            username = '';
-            document.getElementById('chat').style.display = 'none';
-            document.getElementById('auth').style.display = 'block';
-            document.getElementById('chat-box').innerHTML = '';
-            document.getElementById('input').value = '';
-            showMessage('');
-        }
-
-        function loadChat() {
-            fetch('/chat', {
-                headers: { 'Authorization': 'Bearer ' + token }
-            })
-            .then(res => res.json())
-            .then(chats => {
-                const chatBox = document.getElementById('chat-box');
-                chatBox.innerHTML = '';
-                chats.forEach(c => {
-                    chatBox.innerHTML += `<b>Anda:</b> ${c.message}\n<b>GPT:</b> ${c.response}\n\n`;
-                });
-                chatBox.scrollTop = chatBox.scrollHeight;
-            });
-        }
-
-        function sendChat() {
-            const input = document.getElementById('input');
-            const msg = input.value.trim();
-            if (!msg) return;
-            input.value = '';
-            appendMessage('Anda', msg);
-
-            // Panggil API puter.ai chat
-            puter.ai.chat(msg).then(response => {
-                appendMessage('GPT', response);
-                // Simpan chat ke backend
-                fetch('/chat', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': 'Bearer ' + token
-                    },
-                    body: JSON.stringify({ message: msg, response })
-                });
-            });
-        }
-
-        function appendMessage(sender, text) {
-            const chatBox = document.getElementById('chat-box');
-            chatBox.innerHTML += `<b>${sender}:</b> ${text}\n\n`;
-            chatBox.scrollTop = chatBox.scrollHeight;
-        }
-    </script>
-</body>
-</html>
-EOF
-
-echo "Konfigurasi Nginx untuk proxy ke localhost:$PORT"
-cat > /etc/nginx/sites-available/chatgpt << EOF
-server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
-
-    root $FRONTEND_DIR;
-    index index.html;
-
-    location / {
-        try_files \$uri /index.html;
-    }
-
-    location /register {
-        proxy_pass http://localhost:$PORT/register;
-    }
-
-    location /login {
-        proxy_pass http://localhost:$PORT/login;
-    }
-
-    location /chat {
-        proxy_pass http://localhost:$PORT/chat;
-    }
-}
-EOF
-
-ln -sf /etc/nginx/sites-available/chatgpt /etc/nginx/sites-enabled/chatgpt
-nginx -t && systemctl reload nginx
-
-echo "Setup selesai. Server berjalan di http://your_server_ip/"
+echo "Setup selesai! Backend berjalan di http://localhost:8080"
+echo "Cek status service dengan: sudo systemctl status $SERVICE_NAME"
