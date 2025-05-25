@@ -193,7 +193,7 @@ app.post('/clear-chat', auth, (req, res) => {
   res.json({ success: true, message: 'Chat berhasil dihapus' });
 });
 
-app.listen(PORT, () => console.log(`Backend jalan di http://localhost:${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Backend jalan di http://0.0.0.0:${PORT}`));
 EOF
 
 echo "Buat file .env untuk konfigurasi PORT & JWT_SECRET"
@@ -201,6 +201,10 @@ cat > .env <<EOF
 PORT=8080
 JWT_SECRET=rahasia123
 EOF
+
+echo "Buka port 8080 di ufw (jika ufw aktif)..."
+sudo ufw allow 8080/tcp || true
+sudo ufw reload || true
 
 echo "Buat service systemd untuk menjalankan backend"
 sudo tee /etc/systemd/system/$SERVICE_NAME.service > /dev/null <<EOF
@@ -226,5 +230,5 @@ sudo systemctl daemon-reload
 sudo systemctl enable $SERVICE_NAME
 sudo systemctl start $SERVICE_NAME
 
-echo "Setup selesai! Backend berjalan di http://localhost:8080"
+echo "Setup selesai! Backend berjalan di http://0.0.0.0:8080"
 echo "Cek status service dengan: sudo systemctl status $SERVICE_NAME"
