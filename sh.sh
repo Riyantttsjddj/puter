@@ -5,41 +5,34 @@ APP_DIR=/opt/chatgpt-clone
 SERVICE_NAME=chatgpt-clone
 FRONTEND_DIR=/var/www/chatgpt-frontend
 PORT=8080
-APP_USER=chatgpt
 
 echo "Update sistem..."
 apt update && apt upgrade -y
 
 echo "Install dependencies dasar..."
-apt install -y curl git build-essential nginx gnupg lsb-release
+apt install -y curl git build-essential nginx
 
-echo "Install MongoDB dari repo resmi..."
+echo "Setup MongoDB repo untuk Ubuntu jammy"
 curl -fsSL https://pgp.mongodb.com/server-6.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-6.0.gpg
+echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/6.0 multiverse" | tee /etc/apt/sources.list.d/mongodb-org-6.0.list
 
-echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-6.0.gpg ] https://repo.mongodb.org/apt/ubuntu $(lsb_release -cs)/mongodb-org/6.0 multiverse" | \
-  tee /etc/apt/sources.list.d/mongodb-org-6.0.list
-
+echo "Update dan install mongodb-org..."
 apt update
 apt install -y mongodb-org
 
-echo "Enable dan start mongod service..."
+echo "Enable dan start mongodb..."
 systemctl enable mongod
 systemctl start mongod
 
-echo "Install Node.js LTS jika belum ada..."
+# Install Node.js jika belum ada
 if ! command -v node >/dev/null 2>&1; then
+  echo "Install Node.js LTS..."
   curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
   apt install -y nodejs
 fi
 
-echo "Buat user aplikasi '$APP_USER' jika belum ada..."
-if ! id -u $APP_USER >/dev/null 2>&1; then
-  adduser --system --group $APP_USER
-fi
-
 echo "Buat folder aplikasi backend di $APP_DIR"
 mkdir -p $APP_DIR
-chown -R $APP_USER:$APP_USER $APP_DIR
 cd $APP_DIR
 
 echo "Buat package.json"
@@ -151,11 +144,8 @@ app.post('/chat', auth, async (req, res) => {
 app.listen(PORT, () => console.log(\`Server jalan di http://localhost:\${PORT}\`));
 EOF
 
-echo "Set ownership folder backend ke $APP_USER"
-chown -R $APP_USER:$APP_USER $APP_DIR
-
-echo "Install dependencies backend sebagai $APP_USER..."
-sudo -u $APP_USER npm install
+echo "Install dependencies backend..."
+npm install
 
 echo "Setup systemd service $SERVICE_NAME"
 cat > /etc/systemd/system/$SERVICE_NAME.service << EOF
@@ -165,7 +155,7 @@ After=network.target mongod.service
 
 [Service]
 Type=simple
-User=$APP_USER
+User=root
 WorkingDirectory=$APP_DIR
 ExecStart=/usr/bin/node $APP_DIR/server.js
 Restart=on-failure
@@ -322,9 +312,6 @@ cat > $FRONTEND_DIR/index.html << 'EOF'
 </html>
 EOF
 
-echo "Set ownership folder frontend ke $APP_USER"
-chown -R $APP_USER:$APP_USER $FRONTEND_DIR
-
 echo "Konfigurasi Nginx untuk proxy ke localhost:$PORT"
 cat > /etc/nginx/sites-available/chatgpt << EOF
 server {
@@ -338,12 +325,12 @@ server {
         try_files \$uri /index.html;
     }
 
-    location /login {
-        proxy_pass http://localhost:$PORT/login;
-    }
-
     location /register {
         proxy_pass http://localhost:$PORT/register;
+    }
+
+    location /login {
+        proxy_pass http://localhost:$PORT/login;
     }
 
     location /chat {
